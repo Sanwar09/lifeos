@@ -14,6 +14,7 @@ import logging
 from config import settings
 from database import init_db
 from api.routes import router
+from api.auth import router as auth_router
 
 # Configure structured logging
 logging.basicConfig(
@@ -63,6 +64,7 @@ app.add_middleware(
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 app.include_router(router, prefix="/api")
+app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 
 # Determine static files directory robustly
 static_dir = os.path.join(os.path.dirname(__file__), "static")

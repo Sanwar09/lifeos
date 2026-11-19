@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 43200  # 30 days
 
+    # Google OAuth2
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = "http://localhost:8000/api/auth/google/callback"
+
     # OpenAI
     openai_api_key: str = ""
     openai_model: str = "gpt-4o"
