@@ -17,8 +17,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy backend code
 COPY backend/ ./
 
-# Copy built frontend
+# Copy built frontend Vite assets
 COPY --from=frontend-build /app/frontend/dist ./static/
+
+# Copy category.html into static directory so FastAPI serves it correctly at /category.html
+COPY frontend/public/category.html ./static/category.html
 
 # Expose port
 EXPOSE 8000
