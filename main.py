@@ -3,10 +3,10 @@ LifeOS AI — FastAPI Application Entry Point
 Your Personal AI Chief of Staff
 Powered by Lemma SDK
 """
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from contextlib import asynccontextmanager
 import os
 import logging
@@ -14,7 +14,7 @@ import logging
 from config import settings
 from database import init_db
 from api.routes import router
-from api.auth import router as auth_router
+from api.auth import router as auth_router, get_current_user_optional
 
 # Configure structured logging
 logging.basicConfig(
@@ -31,8 +31,9 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 LifeOS AI starting up...")
     await init_db()
 
-    # Ensure upload directory exists
+    # Ensure upload and workspace directories exist
     os.makedirs(settings.upload_dir, exist_ok=True)
+    os.makedirs(os.path.abspath("./workspace"), exist_ok=True)
 
     # Initialize Lemma SDK connection
     if settings.lemma_enabled:
@@ -101,11 +102,39 @@ async def category_page():
     cat_path = os.path.join(static_dir, "category.html")
     if os.path.exists(cat_path):
         return FileResponse(cat_path)
-    # Fallback check in repo root or frontend public
     for fallback in ["category.html", "frontend/public/category.html"]:
         if os.path.exists(fallback):
             return FileResponse(fallback)
     raise HTTPException(status_code=404, detail="category.html not found")
+
+
+@app.get("/dashboard.html", tags=["root"])
+async def dashboard_page(request: Request):
+    """
+    Serve dashboard.html cleanly with authentication check.
+    Redirects to Google login if unauthenticated in production, or allows local dev access.
+    """
+    # Check session cookie or bearer token
+    token = request.cookies.get("access_token")
+    auth_header = request.headers.get("Authorization")
+    
+    if not token and not auth_header and settings.environment == "production" and settings.google_client_id:
+        # Redirect unauthenticated users in production to login page
+        return RedirectResponse(url="/api/auth/google/login", status_code=303)
+
+    dash_path = os.path.join(static_dir, "dashboard.html")
+    if os.path.exists(dash_path):
+        return FileResponse(dash_path)
+    
+    for fallback in ["dashboard.html", "frontend/public/dashboard.html"]:
+        if os.path.exists(fallback):
+            return FileResponse(fallback)
+    raise HTTPException(status_code=404, detail="dashboard.html not found")
+
+
+@app.get("/dashboard", tags=["root"])
+async def dashboard_alias(request: Request):
+    return await dashboard_page(request)
 
 
 @app.get("/health", tags=["root"])

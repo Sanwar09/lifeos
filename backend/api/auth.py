@@ -2,7 +2,7 @@
 LifeOS AI — Google OAuth2 Authentication Module
 Handles secure OAuth2 login, state validation, account provisioning, session cookies, and logout.
 """
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, Status, Request, Cookie
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -28,6 +28,32 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     return jwt.encode(to_encode, settings.secret_key, algorithm=settings.algorithm)
 
 
+async def get_current_user_optional(
+    request: Request,
+    access_token: str | None = Cookie(None),
+    db: AsyncSession = Depends(get_db)
+) -> User | None:
+    """Helper to retrieve current user from cookie or bearer token if present."""
+    token = access_token
+    if not token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+            
+    if not token:
+        return None
+        
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+        email: str = payload.get("sub")
+        if not email:
+            return None
+        result = await db.execute(select(User).where(User.email == email))
+        return result.scalars().first()
+    except Exception:
+        return None
+
+
 @router.get("/google/login", summary="Initiate Google OAuth2 Login Flow")
 async def google_login(response: Response):
     """
@@ -35,23 +61,21 @@ async def google_login(response: Response):
     and redirects the user to Google's OAuth2 consent screen.
     """
     if not settings.google_client_id:
-        # Fallback for development if credentials are not set yet
         logger.warning("Google Client ID is not configured. Redirecting with simulation mode or error.")
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            status_code=503,
             detail="Google OAuth2 is not configured on this server. Please set GOOGLE_CLIENT_ID in environment."
         )
 
     state = secrets.token_urlsafe(32)
     
-    # Store state in a secure cookie for CSRF validation during callback
     response.set_cookie(
         key="oauth_state",
         value=state,
         httponly=True,
         secure=settings.environment == "production",
         samesite="lax",
-        max_age=600  # 10 minutes expiry for state
+        max_age=600
     )
 
     google_auth_url = (
@@ -65,7 +89,7 @@ async def google_login(response: Response):
         "prompt=select_account"
     )
 
-    return RedirectResponse(url=google_auth_url, status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(url=google_auth_url, status_code=303)
 
 
 @router.get("/google/callback", summary="Handle Google OAuth2 Callback & User Provisioning")
@@ -73,30 +97,16 @@ async def google_callback(
     response: Response,
     code: str = Query(...),
     state: str = Query(...),
-    oauth_state: str | None = None,
+    oauth_state: str | None = Cookie(None),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Handles the Google OAuth2 callback:
-    1. Validates the CSRF state token against the session cookie.
-    2. Exchanges the authorization code for Google access and ID tokens.
-    3. Verifies Google claims (including email_verified).
-    4. Automatically provisions or links the user record in the database.
-    5. Issues a secure HttpOnly session JWT cookie and redirects to the dashboard.
+    Handles the Google OAuth2 callback, CSRF validation, token exchange, and user provisioning.
     """
-    # 1. CSRF State validation
-    # Note: FastAPI injects cookies via Cookie() parameter or we can check headers/cookies.
-    # To capture cookie robustly:
-    from fastapi import Cookie
-    # We will declare oauth_state via dependency or parameter below if needed.
-    
-    # Let's perform validation (if oauth_state cookie is missing or mismatch)
-    # For strict compliance, state must match.
     if not oauth_state or state != oauth_state:
         logger.error("OAuth CSRF state mismatch or missing state cookie.")
-        return RedirectResponse(url="/?error=auth_failed_state_mismatch", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(url="/?error=auth_failed_state_mismatch", status_code=303)
 
-    # 2. Exchange authorization code for tokens
     token_url = "https://oauth2.googleapis.com/token"
     payload = {
         "code": code,
@@ -106,139 +116,76 @@ async def google_callback(
         "grant_type": "authorization_code",
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            token_res = await client.post(token_url, data=payload)
-            if token_res.status_code != 200:
-                logger.error("Failed to exchange code with Google: %s", token_res.text)
-                return RedirectResponse(url="/?error=auth_failed_token_exchange", status_code=status.HTTP_303_SEE_OTHER)
-            
-            token_data = token_res.json()
-            id_token_jwt = token_data.get("id_token")
-            access_token = token_data.get("access_token")
+    async with httpx.AsyncClient() as client:
+        token_res = await client.post(token_url, data=payload)
+        if token_res.status_code != 200:
+            logger.error("Failed to exchange Google auth code: %s", token_res.text)
+            return RedirectResponse(url="/?error=token_exchange_failed", status_code=303)
+        
+        token_data = token_res.json()
+        id_token_str = token_data.get("id_token")
+        
+        if not id_token_str:
+            return RedirectResponse(url="/?error=missing_id_token", status_code=303)
 
-            if not id_token_jwt:
-                return RedirectResponse(url="/?error=auth_failed_no_id_token", status_code=status.HTTP_303_SEE_OTHER)
-
-            # 3. Fetch user info from Google userinfo endpoint or decode ID token
-            userinfo_url = "https://www.googleapis.com/oauth2/v3/userinfo"
+        try:
+            # Decode Google ID token (unverified or verified via google API)
+            # For robustness, fetch user info via userinfo endpoint
             userinfo_res = await client.get(
-                userinfo_url,
-                headers={"Authorization": f"Bearer {access_token}"}
+                "https://www.googleapis.com/oauth2/v3/userinfo",
+                headers={"Authorization": f"Bearer {token_data.get('access_token')}"}
             )
             if userinfo_res.status_code != 200:
-                return RedirectResponse(url="/?error=auth_failed_userinfo", status_code=status.HTTP_303_SEE_OTHER)
+                return RedirectResponse(url="/?error=userinfo_failed", status_code=303)
             
-            profile = userinfo_res.json()
+            user_info = userinfo_res.json()
+            email = user_info.get("email")
+            name = user_info.get("name", email.split("@")[0] if email else "User")
+            picture = user_info.get("picture")
 
-    except Exception as e:
-        logger.exception("Network or timeout error during Google OAuth handshake: %s", str(e))
-        return RedirectResponse(url="/?error=auth_network_error", status_code=status.HTTP_502_BAD_GATEWAY)
+            if not email:
+                return RedirectResponse(url="/?error=email_not_provided", status_code=303)
 
-    email = profile.get("email")
-    email_verified = profile.get("email_verified", False)
-    google_id = profile.get("sub")
-    name = profile.get("name", "LifeOS User")
-    avatar_url = profile.get("picture")
+            # Provision or update user in database
+            result = await db.execute(select(User).where(User.email == email))
+            user = result.scalars().first()
 
-    if not email or not email_verified:
-        logger.warning("Google account email not verified or missing: %s", email)
-        return RedirectResponse(url="/?error=email_not_verified", status_code=status.HTTP_303_SEE_OTHER)
-
-    # 4. Database User Provisioning & Account Linking
-    try:
-        result = await db.execute(select(User).where(User.email == email))
-        user = result.scalars().first()
-
-        if user:
-            # Update existing user with Google metadata if not already set
-            if not user.google_id:
-                user.google_id = google_id
-            if avatar_url and not user.avatar_url:
-                user.avatar_url = avatar_url
-            if name and user.name == "LifeOS User":
+            if not user:
+                user = User(
+                    email=email,
+                    name=name,
+                    avatar_url=picture,
+                    is_active=True,
+                    created_at=datetime.utcnow()
+                )
+                db.add(user)
+            else:
                 user.name = name
+                user.avatar_url = picture
+                user.last_login = datetime.utcnow()
+            
             await db.commit()
-            await db.refresh(user)
-        else:
-            # Provision new user
-            user = User(
-                email=email,
-                name=name,
-                google_id=google_id,
-                avatar_url=avatar_url,
-                hashed_password=None,  # No password for pure Google SSO users
-                is_active=True
+
+            # Issue JWT access token cookie
+            access_token = create_access_token(data={"sub": email, "name": name})
+            
+            response.set_cookie(
+                key="access_token",
+                value=access_token,
+                httponly=True,
+                secure=settings.environment == "production",
+                samesite="lax",
+                max_age=settings.access_token_expire_minutes * 60
             )
-            db.add(user)
-            await db.commit()
-            await db.refresh(user)
 
-    except Exception as e:
-        logger.exception("Database error during user provisioning: %s", str(e))
-        await db.rollback()
-        return RedirectResponse(url="/?error=database_error", status_code=status.HTTP_303_SEE_OTHER)
+            return RedirectResponse(url="/dashboard.html", status_code=303)
 
-    # 5. Issue session JWT cookie
-    session_jwt = create_access_token({"sub": user.id, "email": user.email, "name": user.name})
-
-    redirect_response = RedirectResponse(url="/category.html", status_code=status.HTTP_303_SEE_OTHER)
-    
-    # Set HttpOnly session cookie
-    redirect_response.set_cookie(
-        key="lifeos_session",
-        value=session_jwt,
-        httponly=True,
-        secure=settings.environment == "production",
-        samesite="lax",
-        max_age=settings.access_token_expire_minutes * 60
-    )
-
-    # Clear temporary CSRF state cookie
-    redirect_response.delete_cookie(key="oauth_state")
-
-    logger.info("Successfully authenticated user %s via Google OAuth2", email)
-    return redirect_response
+        except Exception as e:
+            logger.exception("Error during Google OAuth callback processing: %s", str(e))
+            return RedirectResponse(url="/?error=internal_auth_error", status_code=303)
 
 
-@router.post("/logout", summary="Log out current user")
+@router.post("/logout", summary="Log out user and clear session cookie")
 async def logout(response: Response):
-    """
-    Invalidates the local session cookie and logs out the user.
-    """
-    response.delete_cookie(key="lifeos_session")
-    return {"status": "success", "message": "Successfully logged out"}
-
-
-@router.get("/me", summary="Get Current Authenticated User Profile")
-async def get_current_user_profile(
-    lifeos_session: str | None = Cookie(None),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Validates the session cookie and returns the current user profile.
-    """
-    if not lifeos_session:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-
-    try:
-        payload = jwt.decode(lifeos_session, settings.secret_key, algorithms=[settings.algorithm])
-        user_id: str = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session token")
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired or invalid")
-
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalars().first()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
-
-    return {
-        "id": user.id,
-        "email": user.email,
-        "name": user.name,
-        "avatar_url": user.avatar_url,
-        "timezone": user.timezone,
-        "created_at": user.created_at.isoformat() if user.created_at else None
-    }
+    response.delete_cookie(key="access_token")
+    return {"status": "logged_out"}

@@ -20,8 +20,9 @@ COPY backend/ ./
 # Copy built frontend Vite assets
 COPY --from=frontend-build /app/frontend/dist ./static/
 
-# Copy category.html into static directory so FastAPI serves it correctly at /category.html
+# Copy category.html and dashboard.html into static directory so FastAPI serves them correctly
 COPY frontend/public/category.html ./static/category.html
+COPY frontend/public/dashboard.html ./static/dashboard.html
 
 # Expose port
 EXPOSE 8000
