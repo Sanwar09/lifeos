@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from contextlib import asynccontextmanager
 import os
 import logging
+from pathlib import Path
 
 from config import settings
 from database import init_db
@@ -63,6 +64,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── Security Header & CSP Middleware ───────────────────────────────────────
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com; "
+        "img-src 'self' data: https:; "
+        "object-src 'none';"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    return response
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 app.include_router(router, prefix="/api")
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
@@ -70,10 +88,12 @@ app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 # Determine static files directory robustly
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if not os.path.exists(static_dir):
-    # Fallback to current working directory static
     static_dir = os.path.abspath("static")
 
-# ─── Static file serving (for uploaded documents and static frontend assets) ──
+# Ensure static dir exists
+os.makedirs(static_dir, exist_ok=True)
+
+# ─── Static file serving ────────────────────────────────────────────────────
 if os.path.exists(settings.upload_dir):
     app.mount("/uploads", StaticFiles(directory=settings.upload_dir), name="uploads")
 
@@ -93,6 +113,7 @@ async def root():
         "status": "running",
         "powered_by": "Lemma SDK",
         "docs": "/api/docs",
+        "dashboard": "/dashboard.html"
     }
 
 
@@ -109,45 +130,20 @@ async def category_page():
 
 
 @app.get("/dashboard.html", tags=["root"])
-async def dashboard_page(request: Request):
+@app.get("/dashboard", tags=["root"])
+async def dashboard_page(request: Request, user = Depends(get_current_user_optional)):
     """
-    Serve dashboard.html cleanly with authentication check.
-    Redirects to Google login if unauthenticated in production, or allows local dev access.
+    Serve dashboard.html securely.
     """
-    # Check session cookie or bearer token
-    token = request.cookies.get("access_token")
-    auth_header = request.headers.get("Authorization")
-    
-    if not token and not auth_header and settings.environment == "production" and settings.google_client_id:
-        # Redirect unauthenticated users in production to login page
-        return RedirectResponse(url="/api/auth/google/login", status_code=303)
+    if settings.environment == "production" and not user and not request.cookies.get("access_token"):
+        return RedirectResponse(url="/api/auth/login", status_code=303)
 
     dash_path = os.path.join(static_dir, "dashboard.html")
     if os.path.exists(dash_path):
         return FileResponse(dash_path)
-    
+        
     for fallback in ["dashboard.html", "frontend/public/dashboard.html"]:
         if os.path.exists(fallback):
             return FileResponse(fallback)
+            
     raise HTTPException(status_code=404, detail="dashboard.html not found")
-
-
-@app.get("/dashboard", tags=["root"])
-async def dashboard_alias(request: Request):
-    return await dashboard_page(request)
-
-
-@app.get("/health", tags=["root"])
-async def health():
-    return {"status": "healthy", "service": "lifeos-ai"}
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host=settings.api_host,
-        port=settings.api_port,
-        reload=settings.debug,
-        log_level="info",
-    )
